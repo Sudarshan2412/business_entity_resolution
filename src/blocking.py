@@ -14,7 +14,7 @@ def normalize_series(names: pd.Series) -> pd.Series:
     s = s.str.replace(r"\s+", " ", regex=True).str.strip()
     return s
 
-def get_banned_tokens(df, max_doc_freq_ratio=0.001, max_doc_freq_abs=500):
+def get_banned_tokens(df, max_doc_freq_ratio=0.005, max_doc_freq_abs=1_000_000):
     """Ban a token if it's too common: either above max_doc_freq_ratio of
     the source's rows, OR above the absolute cap max_doc_freq_abs —
     whichever limit is stricter."""
