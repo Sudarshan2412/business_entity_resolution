@@ -1,8 +1,8 @@
 import re
 import pickle
 from pathlib import Path
-import numpy as np
 import pandas as pd
+from src.config import OUTPUT
 
 LEGAL_SUFFIXES_PATTERN = r"\b(corp|corporation|pvt|private|ltd|limited|llc|inc|incorporated|co)\b\.?"
 
@@ -23,12 +23,11 @@ def build_token_index(df, cache_path=None, max_doc_freq_ratio=0.005):
     normalized = normalize_series(df["business_name"])
     tok_lists = normalized.str.split()
 
-    # map entity_id strings -> int32 once, so all downstream sets store ints not strings
-    ids_int = np.arange(len(df), dtype=np.int32)
-    id_map = dict(zip(ids_int, df["entity_id"].values))  # int -> original string, for later lookup
+    ids_int = range(len(df))
+    id_map = dict(zip(ids_int, df["entity_id"].values))
 
     print("  exploding tokens...", flush=True)
-    exploded = pd.Series(tok_lists.values, index=ids_int).explode().dropna()
+    exploded = pd.Series(tok_lists.values, index=list(ids_int)).explode().dropna()
 
     print("  computing document frequency...", flush=True)
     freq = exploded.value_counts()
@@ -48,7 +47,8 @@ def build_token_index(df, cache_path=None, max_doc_freq_ratio=0.005):
         print(f"  cached index to {cache_path}", flush=True)
     return result
 
-def generate_candidates(s1_df, s2_df, s3_df, cache_dir="/content/business_entity_resolution/output/cache"):
+def generate_candidates(s1_df, s2_df, s3_df, cache_dir=None):
+    cache_dir = cache_dir or (OUTPUT / "cache")
     print("indexing source 2...", flush=True)
     r2 = build_token_index(s2_df, cache_path=f"{cache_dir}/idx2.pkl")
     print("indexing source 3...", flush=True)
