@@ -1,9 +1,8 @@
 import re
-import pickle
+import csv
 from pathlib import Path
 from collections import defaultdict
 import pandas as pd
-from src.config import OUTPUT
 
 LEGAL_SUFFIXES_PATTERN = r"\b(corp|corporation|pvt|private|ltd|limited|llc|inc|incorporated|co)\b\.?"
 
@@ -15,9 +14,6 @@ def normalize_series(names: pd.Series) -> pd.Series:
     return s
 
 def get_banned_tokens(df, max_doc_freq_ratio=0.005, max_doc_freq_abs=1_000_000):
-    """Ban a token if it's too common: either above max_doc_freq_ratio of
-    the source's rows, OR above the absolute cap max_doc_freq_abs —
-    whichever limit is stricter."""
     normalized = normalize_series(df["business_name"])
     tok_lists = normalized.str.split()
     s = pd.Series(tok_lists.values, index=df["entity_id"].values).explode().dropna()
@@ -26,7 +22,6 @@ def get_banned_tokens(df, max_doc_freq_ratio=0.005, max_doc_freq_abs=1_000_000):
     return set(freq[freq > max_freq].index)
 
 def build_inverted_index(df, banned=None):
-    """token -> set(entity_id). No pandas merge, no cross-join."""
     normalized = normalize_series(df["business_name"])
     idx = defaultdict(set)
     for eid, name in zip(df["entity_id"].values, normalized.values):
@@ -36,84 +31,105 @@ def build_inverted_index(df, banned=None):
             idx[tok].add(eid)
     return idx
 
-def generate_candidates(s1_df, s2_df, s3_df, chunk_size=50_000, checkpoint_path=None):
-    """Inverted-index based candidate generation. Memory stays flat no
-    matter how much of s1 you feed in."""
-    print("computing banned tokens...", flush=True)
-    banned = get_banned_tokens(s2_df) | get_banned_tokens(s3_df)
-    print(f"  {len(banned)} tokens banned total", flush=True)
+def already_written_ids(out_path):
+    """Read just the first column of an existing output file, to support
+    resuming without recomputing rows we already wrote."""
+    if not Path(out_path).exists():
+        return set()
+    done = set()
+    with open(out_path, "r") as f:
+        reader = csv.reader(f, delimiter="\t")
+        header = next(reader, None)
+        for row in reader:
+            if row:
+                done.add(row[0])
+    return done
 
-    print("building inverted index for source2/3...", flush=True)
-    idx2 = build_inverted_index(s2_df, banned=banned)
-    idx3 = build_inverted_index(s3_df, banned=banned)
+def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path, flush_every=2000):
+    """Streams source1_entity_id -> candidate_entity_ids straight to a TSV,
+    one row at a time. Never holds more than the current country's index
+    plus one row's candidate set in memory."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    all_candidates = {}
-    if checkpoint_path and Path(checkpoint_path).exists():
-        with open(checkpoint_path, "rb") as f:
-            all_candidates = pickle.load(f)
-        print(f"  resumed {len(all_candidates)} entities from checkpoint", flush=True)
+    skip_ids = already_written_ids(out_path)
+    write_header = not out_path.exists() or out_path.stat().st_size == 0
+    print(f"resuming: {len(skip_ids)} rows already written, will skip those", flush=True)
 
-    s1_remaining = s1_df[~s1_df["entity_id"].isin(all_candidates.keys())]
-    normalized = normalize_series(s1_remaining["business_name"])
-    print(f"  {len(s1_remaining)} source1 entities left to process", flush=True)
-
-    count = 0
-    for eid, name in zip(s1_remaining["entity_id"].values, normalized.values):
-        cands = set()
-        for tok in name.split():
-            cands |= idx2.get(tok, set())
-            cands |= idx3.get(tok, set())
-        all_candidates[eid] = cands
-        count += 1
-        if count % chunk_size == 0:
-            print(f"  processed {count}/{len(s1_remaining)}", flush=True)
-            if checkpoint_path:
-                Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
-                with open(checkpoint_path, "wb") as f:
-                    pickle.dump(all_candidates, f)
-
-    if checkpoint_path:
-        Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(checkpoint_path, "wb") as f:
-            pickle.dump(all_candidates, f)
-
-    return all_candidates
-
-def generate_candidates_by_country(s1_df, s2_df, s3_df, chunk_size=50_000, checkpoint_dir=None):
-    """Runs generate_candidates separately per country, then merges the
-    results. A record from one country can never match a record from
-    another, so this shrinks the comparison universe for free."""
-    all_candidates = {}
     countries = sorted(s1_df["country"].dropna().unique())
-    print(f"countries found: {countries}", flush=True)
+    print(f"countries: {countries}", flush=True)
 
-    for country in countries:
-        print(f"\n=== country: {country} ===", flush=True)
-        s1_c = s1_df[s1_df["country"] == country]
-        s2_c = s2_df[s2_df["country"] == country]
-        s3_c = s3_df[s3_df["country"] == country]
+    mode = "a"
+    with open(out_path, mode, newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        if write_header:
+            writer.writerow(["source1_entity_id", "candidate_entity_ids"])
 
-        checkpoint_path = None
-        if checkpoint_dir:
-            safe_name = country.replace(" ", "_")
-            checkpoint_path = Path(checkpoint_dir) / f"candidates_{safe_name}.pkl"
+        for country in countries:
+            print(f"\n=== country: {country} ===", flush=True)
+            s1_c = s1_df[s1_df["country"] == country]
+            s2_c = s2_df[s2_df["country"] == country]
+            s3_c = s3_df[s3_df["country"] == country]
 
-        country_candidates = generate_candidates(
-            s1_c, s2_c, s3_c,
-            chunk_size=chunk_size,
-            checkpoint_path=checkpoint_path,
-        )
-        all_candidates.update(country_candidates)
+            s1_c = s1_c[~s1_c["entity_id"].isin(skip_ids)]
+            if len(s1_c) == 0:
+                print("  already fully done, skipping", flush=True)
+                continue
 
-    return all_candidates
+            print("  computing banned tokens...", flush=True)
+            banned = get_banned_tokens(s2_c) | get_banned_tokens(s3_c)
 
-def blocking_recall(candidates: dict, gold_df) -> float:
+            print("  building inverted index...", flush=True)
+            idx2 = build_inverted_index(s2_c, banned=banned)
+            idx3 = build_inverted_index(s3_c, banned=banned)
+
+            normalized = normalize_series(s1_c["business_name"])
+            total = len(s1_c)
+            print(f"  {total} entities to process", flush=True)
+
+            count = 0
+            for eid, name in zip(s1_c["entity_id"].values, normalized.values):
+                cands = set()
+                for tok in name.split():
+                    cands |= idx2.get(tok, set())
+                    cands |= idx3.get(tok, set())
+                writer.writerow([eid, ",".join(sorted(cands))])
+                count += 1
+                if count % flush_every == 0:
+                    f.flush()
+                    print(f"    {count}/{total} processed", flush=True)
+
+            f.flush()
+            # free this country's index before moving to the next
+            del idx2, idx3
+
+    print(f"\ndone — output at {out_path}", flush=True)
+
+def blocking_recall_from_file(candidates_path, gold_df):
+    """Streams the candidates file row by row against an in-memory gold
+    lookup (gold_df itself is small enough to hold fully — ~2.2M short
+    rows), so this never needs the full candidates dict in memory."""
     from src.scoring import parse_id_list
-    hits, total = 0, 0
+
+    gold_map = {}
     for eid, matched in zip(gold_df["source1_entity_id"], gold_df["matched_entity_ids"]):
         true_ids = parse_id_list(matched)
-        if not true_ids:
-            continue
-        total += len(true_ids)
-        hits += len(true_ids & candidates.get(eid, set()))
+        if true_ids:
+            gold_map[eid] = true_ids
+
+    hits, total = 0, 0
+    with open(candidates_path, "r") as f:
+        reader = csv.reader(f, delimiter="\t")
+        next(reader, None)  # header
+        for row in reader:
+            if not row:
+                continue
+            eid, cand_str = row[0], row[1] if len(row) > 1 else ""
+            true_ids = gold_map.get(eid)
+            if not true_ids:
+                continue
+            cand_ids = set(cand_str.split(",")) if cand_str else set()
+            total += len(true_ids)
+            hits += len(true_ids & cand_ids)
+
     return hits / total if total else float("nan")
