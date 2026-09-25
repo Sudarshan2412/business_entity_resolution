@@ -1,6 +1,7 @@
 import re
 import pickle
 from pathlib import Path
+from collections import defaultdict
 import pandas as pd
 from src.config import OUTPUT
 
@@ -13,28 +14,19 @@ def normalize_series(names: pd.Series) -> pd.Series:
     s = s.str.replace(r"\s+", " ", regex=True).str.strip()
     return s
 
-def token_dataframe(df, banned=None):
-    """entity_id, token pairs — one row per token occurrence, exploded."""
-    normalized = normalize_series(df["business_name"])
-    tok_lists = normalized.str.split()
-    s = pd.Series(tok_lists.values, index=df["entity_id"].values).explode().dropna()
-    tdf = s.reset_index()
-    tdf.columns = ["entity_id", "token"]
-    if banned:
-        tdf = tdf[~tdf["token"].isin(banned)]
-    return tdf
-
-def get_banned_tokens(df, max_doc_freq_ratio=0.005):
+def get_banned_tokens(df, max_doc_freq_ratio=0.001, max_doc_freq_abs=500):
+    """Ban a token if it's too common: either above max_doc_freq_ratio of
+    the source's rows, OR above the absolute cap max_doc_freq_abs —
+    whichever limit is stricter."""
     normalized = normalize_series(df["business_name"])
     tok_lists = normalized.str.split()
     s = pd.Series(tok_lists.values, index=df["entity_id"].values).explode().dropna()
     freq = s.value_counts()
-    max_freq = max(1, int(len(df) * max_doc_freq_ratio))
+    max_freq = max(1, min(int(len(df) * max_doc_freq_ratio), max_doc_freq_abs))
     return set(freq[freq > max_freq].index)
 
-from collections import defaultdict
-
 def build_inverted_index(df, banned=None):
+    """token -> set(entity_id). No pandas merge, no cross-join."""
     normalized = normalize_series(df["business_name"])
     idx = defaultdict(set)
     for eid, name in zip(df["entity_id"].values, normalized.values):
@@ -45,6 +37,8 @@ def build_inverted_index(df, banned=None):
     return idx
 
 def generate_candidates(s1_df, s2_df, s3_df, chunk_size=50_000, checkpoint_path=None):
+    """Inverted-index based candidate generation. Memory stays flat no
+    matter how much of s1 you feed in."""
     print("computing banned tokens...", flush=True)
     banned = get_banned_tokens(s2_df) | get_banned_tokens(s3_df)
     print(f"  {len(banned)} tokens banned total", flush=True)
@@ -79,10 +73,40 @@ def generate_candidates(s1_df, s2_df, s3_df, chunk_size=50_000, checkpoint_path=
                     pickle.dump(all_candidates, f)
 
     if checkpoint_path:
+        Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
         with open(checkpoint_path, "wb") as f:
             pickle.dump(all_candidates, f)
 
     return all_candidates
+
+def generate_candidates_by_country(s1_df, s2_df, s3_df, chunk_size=50_000, checkpoint_dir=None):
+    """Runs generate_candidates separately per country, then merges the
+    results. A record from one country can never match a record from
+    another, so this shrinks the comparison universe for free."""
+    all_candidates = {}
+    countries = sorted(s1_df["country"].dropna().unique())
+    print(f"countries found: {countries}", flush=True)
+
+    for country in countries:
+        print(f"\n=== country: {country} ===", flush=True)
+        s1_c = s1_df[s1_df["country"] == country]
+        s2_c = s2_df[s2_df["country"] == country]
+        s3_c = s3_df[s3_df["country"] == country]
+
+        checkpoint_path = None
+        if checkpoint_dir:
+            safe_name = country.replace(" ", "_")
+            checkpoint_path = Path(checkpoint_dir) / f"candidates_{safe_name}.pkl"
+
+        country_candidates = generate_candidates(
+            s1_c, s2_c, s3_c,
+            chunk_size=chunk_size,
+            checkpoint_path=checkpoint_path,
+        )
+        all_candidates.update(country_candidates)
+
+    return all_candidates
+
 def blocking_recall(candidates: dict, gold_df) -> float:
     from src.scoring import parse_id_list
     hits, total = 0, 0
