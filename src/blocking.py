@@ -1,28 +1,37 @@
 import re
+import pickle
+from pathlib import Path
 from collections import defaultdict
+import pandas as pd
 
-LEGAL_SUFFIXES = re.compile(
-    r"\b(corp|corporation|pvt|private|ltd|limited|llc|inc|incorporated|co)\b\.?",
-    flags=re.IGNORECASE,
-)
+LEGAL_SUFFIXES_PATTERN = r"\b(corp|corporation|pvt|private|ltd|limited|llc|inc|incorporated|co)\b\.?"
+
+def normalize_series(names: pd.Series) -> pd.Series:
+    """Vectorized normalization — pandas applies these as bulk operations,
+    much faster than calling re.sub() per row in a Python loop."""
+    s = names.astype(str).str.lower()
+    s = s.str.replace(LEGAL_SUFFIXES_PATTERN, "", regex=True)
+    s = s.str.replace(r"[^a-z0-9\s]", " ", regex=True)
+    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
+    return s
 
 def normalize_name(name: str) -> str:
+    """Single-string version, kept for one-off use elsewhere."""
     name = str(name).lower()
-    name = LEGAL_SUFFIXES.sub("", name)
+    name = re.sub(LEGAL_SUFFIXES_PATTERN, "", name, flags=re.IGNORECASE)
     name = re.sub(r"[^a-z0-9\s]", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name
 
-def name_tokens(name: str) -> set:
-    return set(normalize_name(name).split())
+def build_token_index(df, cache_path=None, max_doc_freq_ratio=0.005):
+    if cache_path and Path(cache_path).exists():
+        print(f"  loading cached index from {cache_path}")
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
 
-def build_token_index(df, max_doc_freq_ratio=0.005):
-    """Token -> set of entity_ids, dropping tokens that appear in too many records
-    (they're useless for blocking and cause candidate-set explosions)."""
     ids = df["entity_id"].values
-    names = df["business_name"].values
-
-    token_lists = [name_tokens(n) for n in names]  # still O(n) but no iterrows overhead
+    normalized = normalize_series(df["business_name"])
+    token_lists = normalized.str.split()
 
     doc_freq = defaultdict(int)
     for toks in token_lists:
@@ -38,26 +47,33 @@ def build_token_index(df, max_doc_freq_ratio=0.005):
         for tok in toks:
             if tok not in banned:
                 idx[tok].add(eid)
+
+    if cache_path:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(dict(idx), f)
+        print(f"  cached index to {cache_path}")
+
     return idx
 
-def generate_candidates(s1_df, s2_df, s3_df, max_doc_freq_ratio=0.005):
+def generate_candidates(s1_df, s2_df, s3_df, cache_dir="/content/business_entity_resolution/output/cache"):
     print("indexing source 2...")
-    idx2 = build_token_index(s2_df, max_doc_freq_ratio)
+    idx2 = build_token_index(s2_df, cache_path=f"{cache_dir}/idx2.pkl")
     print("indexing source 3...")
-    idx3 = build_token_index(s3_df, max_doc_freq_ratio)
+    idx3 = build_token_index(s3_df, cache_path=f"{cache_dir}/idx3.pkl")
 
     s1_ids = s1_df["entity_id"].values
-    s1_names = s1_df["business_name"].values
+    s1_normalized = normalize_series(s1_df["business_name"])
+    s1_token_lists = s1_normalized.str.split()
 
     candidates = {}
-    for i, (eid, name) in enumerate(zip(s1_ids, s1_names)):
-        toks = name_tokens(name)
+    for i, (eid, toks) in enumerate(zip(s1_ids, s1_token_lists)):
         cand = set()
         for tok in toks:
             cand |= idx2.get(tok, set())
             cand |= idx3.get(tok, set())
         candidates[eid] = cand
-        if i % 200000 == 0:
+        if i % 1000 == 0:
             print(f"  {i}/{len(s1_ids)} source1 entities processed")
     return candidates
 
