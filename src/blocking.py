@@ -92,20 +92,31 @@ def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path, flush_every=2000)
             total = len(s1_c)
             print(f"  {total} entities to process", flush=True)
             count = 0
-            MAX_CANDIDATES = 1000 # Increased cap, but enforced smartly
-            
+            MAX_CANDIDATES = 1500 # Slightly increased to allow more initial recall
+        
             for eid, name in zip(s1_c["entity_id"].values, normalized.values):
                 cand_counter = Counter()
                 for tok in name.split():
-                    # Instead of sets, count how many tokens overlap
                     for cand_id in idx2.get(tok, []): 
                         cand_counter[cand_id] += 1
                     for cand_id in idx3.get(tok, []):
                         cand_counter[cand_id] += 1
                 
-                # Keep only the top MAX_CANDIDATES based on overlap score
-                best_cands = [cand_id for cand_id, score in cand_counter.most_common(MAX_CANDIDATES)]
-                
+                # We use set union for the top tier to ensure we don't arbitrarily drop ties
+                best_cands = set()
+                if cand_counter:
+                    # Get the max score for this specific entity
+                    max_score = max(cand_counter.values())
+                    
+                    # Add all candidates that have at least half the max score, up to the cap
+                    for cand_id, score in cand_counter.most_common(MAX_CANDIDATES):
+                        if score >= max_score / 2:
+                            best_cands.add(cand_id)
+                        elif len(best_cands) < 500: # Ensure we at least capture some lower-scoring ones if the list is small
+                            best_cands.add(cand_id)
+                        else:
+                            break
+                    
                 writer.writerow([eid, ",".join(sorted(best_cands))])
                 count += 1
                 if count % flush_every == 0:
