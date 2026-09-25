@@ -1,8 +1,11 @@
 import re
 import csv
+import sys
 from pathlib import Path
 from collections import defaultdict
 import pandas as pd
+
+csv.field_size_limit(sys.maxsize)
 
 LEGAL_SUFFIXES_PATTERN = r"\b(corp|corporation|pvt|private|ltd|limited|llc|inc|incorporated|co)\b\.?"
 
@@ -88,11 +91,14 @@ def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path, flush_every=2000)
             print(f"  {total} entities to process", flush=True)
 
             count = 0
+            MAX_CANDIDATES_PER_ENTITY = 500
             for eid, name in zip(s1_c["entity_id"].values, normalized.values):
                 cands = set()
                 for tok in name.split():
                     cands |= idx2.get(tok, set())
                     cands |= idx3.get(tok, set())
+                if len(cands) > MAX_CANDIDATES_PER_ENTITY:
+                    cands = set(list(cands)[:MAX_CANDIDATES_PER_ENTITY])
                 writer.writerow([eid, ",".join(sorted(cands))])
                 count += 1
                 if count % flush_every == 0:
