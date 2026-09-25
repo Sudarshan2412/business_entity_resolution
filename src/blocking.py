@@ -87,19 +87,26 @@ def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path, flush_every=2000)
             idx3 = build_inverted_index(s3_c, banned=banned)
 
             normalized = normalize_series(s1_c["business_name"])
+            from collections import Counter # ADD THIS IMPORT at the top of your file
+            
             total = len(s1_c)
             print(f"  {total} entities to process", flush=True)
-
             count = 0
-            # MAX_CANDIDATES_PER_ENTITY = 500
+            MAX_CANDIDATES = 1000 # Increased cap, but enforced smartly
+            
             for eid, name in zip(s1_c["entity_id"].values, normalized.values):
-                cands = set()
+                cand_counter = Counter()
                 for tok in name.split():
-                    cands |= idx2.get(tok, set())
-                    cands |= idx3.get(tok, set())
-                # if len(cands) > MAX_CANDIDATES_PER_ENTITY:
-                #     cands = set(list(cands)[:MAX_CANDIDATES_PER_ENTITY])
-                writer.writerow([eid, ",".join(sorted(cands))])
+                    # Instead of sets, count how many tokens overlap
+                    for cand_id in idx2.get(tok, []): 
+                        cand_counter[cand_id] += 1
+                    for cand_id in idx3.get(tok, []):
+                        cand_counter[cand_id] += 1
+                
+                # Keep only the top MAX_CANDIDATES based on overlap score
+                best_cands = [cand_id for cand_id, score in cand_counter.most_common(MAX_CANDIDATES)]
+                
+                writer.writerow([eid, ",".join(sorted(best_cands))])
                 count += 1
                 if count % flush_every == 0:
                     f.flush()
