@@ -13,64 +13,67 @@ def normalize_series(names: pd.Series) -> pd.Series:
     s = s.str.replace(r"\s+", " ", regex=True).str.strip()
     return s
 
-def build_token_index(df, cache_path=None, max_doc_freq_ratio=0.005):
-    if cache_path and Path(cache_path).exists():
-        print(f"  loading cached index from {cache_path}", flush=True)
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
-    print(f"  normalizing {len(df)} names...", flush=True)
+def token_dataframe(df, banned=None):
+    """entity_id, token pairs — one row per token occurrence, exploded."""
     normalized = normalize_series(df["business_name"])
     tok_lists = normalized.str.split()
+    s = pd.Series(tok_lists.values, index=df["entity_id"].values).explode().dropna()
+    tdf = s.reset_index()
+    tdf.columns = ["entity_id", "token"]
+    if banned:
+        tdf = tdf[~tdf["token"].isin(banned)]
+    return tdf
 
-    ids_int = range(len(df))
-    id_map = dict(zip(ids_int, df["entity_id"].values))
-
-    print("  exploding tokens...", flush=True)
-    exploded = pd.Series(tok_lists.values, index=list(ids_int)).explode().dropna()
-
-    print("  computing document frequency...", flush=True)
-    freq = exploded.value_counts()
+def get_banned_tokens(df, max_doc_freq_ratio=0.005):
+    normalized = normalize_series(df["business_name"])
+    tok_lists = normalized.str.split()
+    s = pd.Series(tok_lists.values, index=df["entity_id"].values).explode().dropna()
+    freq = s.value_counts()
     max_freq = max(1, int(len(df) * max_doc_freq_ratio))
-    banned = set(freq[freq > max_freq].index)
-    print(f"  dropping {len(banned)} overly common tokens (freq > {max_freq})", flush=True)
-    exploded = exploded[~exploded.isin(banned)]
+    return set(freq[freq > max_freq].index)
 
-    print("  grouping into index (int-encoded)...", flush=True)
-    idx = exploded.groupby(exploded.values).apply(lambda s: frozenset(s.index)).to_dict()
+def generate_candidates(s1_df, s2_df, s3_df, chunk_size=100_000, checkpoint_path=None):
+    """Vectorized via merge, processed in chunks of s1 to bound memory,
+    with optional checkpointing so a crash doesn't lose everything."""
+    print("computing banned tokens...", flush=True)
+    banned = get_banned_tokens(s2_df) | get_banned_tokens(s3_df)
+    print(f"  {len(banned)} tokens banned total", flush=True)
 
-    result = {"idx": idx, "id_map": id_map}
-    if cache_path:
-        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(result, f)
-        print(f"  cached index to {cache_path}", flush=True)
-    return result
+    print("building token tables for source2/3...", flush=True)
+    s2_tok = token_dataframe(s2_df, banned=banned)
+    s3_tok = token_dataframe(s3_df, banned=banned)
 
-def generate_candidates(s1_df, s2_df, s3_df, cache_dir=None):
-    cache_dir = cache_dir or (OUTPUT / "cache")
-    print("indexing source 2...", flush=True)
-    r2 = build_token_index(s2_df, cache_path=f"{cache_dir}/idx2.pkl")
-    print("indexing source 3...", flush=True)
-    r3 = build_token_index(s3_df, cache_path=f"{cache_dir}/idx3.pkl")
-    idx2, map2 = r2["idx"], r2["id_map"]
-    idx3, map3 = r3["idx"], r3["id_map"]
+    all_candidates = {}
+    if checkpoint_path and Path(checkpoint_path).exists():
+        with open(checkpoint_path, "rb") as f:
+            all_candidates = pickle.load(f)
+        print(f"  resumed {len(all_candidates)} entities from checkpoint", flush=True)
 
-    print("building candidates for source1...", flush=True)
-    s1_ids = s1_df["entity_id"].values
-    s1_tok_lists = normalize_series(s1_df["business_name"]).str.split()
+    s1_ids_all = s1_df["entity_id"].values
+    remaining_mask = ~pd.Series(s1_ids_all).isin(all_candidates.keys())
+    s1_remaining = s1_df[remaining_mask.values]
+    print(f"  {len(s1_remaining)} source1 entities left to process", flush=True)
 
-    candidates = {}
-    for i, (eid, toks) in enumerate(zip(s1_ids, s1_tok_lists)):
-        cand_int2, cand_int3 = set(), set()
-        for tok in toks:
-            cand_int2 |= idx2.get(tok, frozenset())
-            cand_int3 |= idx3.get(tok, frozenset())
-        cand = {map2[j] for j in cand_int2} | {map3[j] for j in cand_int3}
-        candidates[eid] = cand
-        if i % 500 == 0:
-            print(f"  {i}/{len(s1_ids)} source1 entities processed", flush=True)
-    return candidates
+    for start in range(0, len(s1_remaining), chunk_size):
+        chunk = s1_remaining.iloc[start:start + chunk_size]
+        s1_tok = token_dataframe(chunk, banned=banned)
+
+        m2 = s1_tok.merge(s2_tok, on="token", suffixes=("_s1", "_s2"))
+        m3 = s1_tok.merge(s3_tok, on="token", suffixes=("_s1", "_s3"))
+
+        cand2 = m2.groupby("entity_id_s1")["entity_id_s2"].apply(lambda x: set(x))
+        cand3 = m3.groupby("entity_id_s1")["entity_id_s3"].apply(lambda x: set(x))
+
+        for eid in chunk["entity_id"].values:
+            all_candidates[eid] = cand2.get(eid, set()) | cand3.get(eid, set())
+
+        print(f"  processed {start + len(chunk)}/{len(s1_remaining)}", flush=True)
+        if checkpoint_path:
+            Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(checkpoint_path, "wb") as f:
+                pickle.dump(all_candidates, f)
+
+    return all_candidates
 
 def blocking_recall(candidates: dict, gold_df) -> float:
     from src.scoring import parse_id_list

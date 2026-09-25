@@ -1,7 +1,9 @@
 student_resource/dataset/
 student_resource/__MACOSX/
-*.zip
+output/cache/
 output/*.tsv
+*.zip
+*.pkl
 __pycache__/
 *.pyc
 .DS_Store
