@@ -1,4 +1,3 @@
-%%writefile /kaggle/working/business_entity_resolution/src/blocking.py
 import re
 import csv
 import sys
