@@ -2,12 +2,13 @@ import re
 import csv
 import sys
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 import pandas as pd
 
 csv.field_size_limit(sys.maxsize)
 
 LEGAL_SUFFIXES_PATTERN = r"\b(corp|corporation|pvt|private|ltd|limited|llc|inc|incorporated|co)\b\.?"
+MAX_CANDIDATES_PER_ENTITY = 100  # tune down further once you check recall holds
 
 def normalize_series(names: pd.Series) -> pd.Series:
     s = names.astype(str).str.lower()
@@ -35,23 +36,35 @@ def build_inverted_index(df, banned=None):
     return idx
 
 def already_written_ids(out_path):
-    """Read just the first column of an existing output file, to support
-    resuming without recomputing rows we already wrote."""
     if not Path(out_path).exists():
         return set()
     done = set()
     with open(out_path, "r") as f:
         reader = csv.reader(f, delimiter="\t")
-        header = next(reader, None)
+        next(reader, None)
         for row in reader:
             if row:
                 done.add(row[0])
     return done
 
-def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path, flush_every=2000):
-    """Streams source1_entity_id -> candidate_entity_ids straight to a TSV,
-    one row at a time. Never holds more than the current country's index
-    plus one row's candidate set in memory."""
+def top_k_candidates(name_tokens, idx2, idx3, k=MAX_CANDIDATES_PER_ENTITY):
+    """Score each candidate by how many query tokens it shares (token-overlap
+    count), keep the top-k. This is the ranking that actually matters — a
+    candidate sharing 4 tokens with the query is far more likely to be a true
+    match than one sharing 1, so this keeps the candidates most worth scoring
+    later, not an arbitrary subset."""
+    scores = Counter()
+    for tok in name_tokens:
+        for cid in idx2.get(tok, ()):
+            scores[cid] += 1
+        for cid in idx3.get(tok, ()):
+            scores[cid] += 1
+    if not scores:
+        return set()
+    return {cid for cid, _ in scores.most_common(k)}
+
+def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path, flush_every=2000,
+                                 max_candidates=MAX_CANDIDATES_PER_ENTITY):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -62,8 +75,10 @@ def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path, flush_every=2000)
     countries = sorted(s1_df["country"].dropna().unique())
     print(f"countries: {countries}", flush=True)
 
-    mode = "a"
-    with open(out_path, mode, newline="") as f:
+    total_candidates_written = 0
+    entities_written = 0
+
+    with open(out_path, "a", newline="") as f:
         writer = csv.writer(f, delimiter="\t")
         if write_header:
             writer.writerow(["source1_entity_id", "candidate_entity_ids"])
@@ -91,30 +106,25 @@ def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path, flush_every=2000)
             print(f"  {total} entities to process", flush=True)
 
             count = 0
-            # MAX_CANDIDATES_PER_ENTITY = 500
             for eid, name in zip(s1_c["entity_id"].values, normalized.values):
-                cands = set()
-                for tok in name.split():
-                    cands |= idx2.get(tok, set())
-                    cands |= idx3.get(tok, set())
-                # if len(cands) > MAX_CANDIDATES_PER_ENTITY:
-                #     cands = set(list(cands)[:MAX_CANDIDATES_PER_ENTITY])
+                toks = name.split()
+                cands = top_k_candidates(toks, idx2, idx3, k=max_candidates)
                 writer.writerow([eid, ",".join(sorted(cands))])
+                total_candidates_written += len(cands)
+                entities_written += 1
                 count += 1
                 if count % flush_every == 0:
                     f.flush()
                     print(f"    {count}/{total} processed", flush=True)
 
             f.flush()
-            # free this country's index before moving to the next
             del idx2, idx3
 
+    avg = total_candidates_written / entities_written if entities_written else 0
     print(f"\ndone — output at {out_path}", flush=True)
+    print(f"avg candidates/entity this run: {avg:.1f}", flush=True)
 
 def blocking_recall_from_file(candidates_path, gold_df):
-    """Streams the candidates file row by row against an in-memory gold
-    lookup (gold_df itself is small enough to hold fully — ~2.2M short
-    rows), so this never needs the full candidates dict in memory."""
     from src.scoring import parse_id_list
 
     gold_map = {}
@@ -126,7 +136,7 @@ def blocking_recall_from_file(candidates_path, gold_df):
     hits, total = 0, 0
     with open(candidates_path, "r") as f:
         reader = csv.reader(f, delimiter="\t")
-        next(reader, None)  # header
+        next(reader, None)
         for row in reader:
             if not row:
                 continue
