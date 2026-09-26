@@ -2,7 +2,9 @@ import re
 import csv
 import sys
 from pathlib import Path
+import numpy as np
 import pandas as pd
+from sklearn.feature_extraction.text import CountVectorizer
 
 csv.field_size_limit(sys.maxsize)
 
@@ -11,7 +13,7 @@ ADDRESS_NOISE_PATTERN = r"\b(road|rd|street|st|avenue|ave|near|india|us|usa|unit
 
 NAME_TOP_K = 75
 ADDR_TOP_K = 75
-CHUNK_SIZE = 20_000  # s1 rows processed per merge batch — tune down if RAM spikes, up if it stays low
+QUERY_CHUNK = 20_000  # s1 rows per matrix-multiply batch, bounds peak memory of the similarity matrix
 
 def normalize_name_series(names: pd.Series) -> pd.Series:
     s = names.astype(str).str.lower()
@@ -27,33 +29,29 @@ def normalize_address_series(addrs: pd.Series) -> pd.Series:
     s = s.str.replace(r"\s+", " ", regex=True).str.strip()
     return s
 
-def token_table(entity_ids, normalized_series, banned=None):
-    """entity_id, token — one row per token occurrence."""
-    tok_lists = normalized_series.str.split()
-    s = pd.Series(tok_lists.values, index=entity_ids).explode().dropna()
-    if banned:
-        s = s[~s.isin(banned)]
-    df = s.reset_index()
-    df.columns = ["entity_id", "token"]
-    return df
+def build_vectorizer(corpus_texts, max_df=0.005):
+    vec = CountVectorizer(token_pattern=r"\S+", binary=True, max_df=max_df, min_df=1)
+    matrix = vec.fit_transform(corpus_texts)
+    return vec, matrix.tocsr()
 
-def get_banned_tokens(tok_df, n_entities, max_doc_freq_ratio=0.005, max_doc_freq_abs=1_000_000):
-    freq = tok_df.groupby("token")["entity_id"].nunique()
-    max_freq = max(1, min(int(n_entities * max_doc_freq_ratio), max_doc_freq_abs))
-    return set(freq[freq > max_freq].index)
-
-def top_k_via_merge(query_tok, corpus_tok, k):
-    """query_tok, corpus_tok: [entity_id, token] tables. Returns a Series
-    keyed by query entity_id, each value a set of top-k candidate ids by
-    shared-token count. All heavy lifting is pandas merge/groupby (C-level),
-    not a Python loop."""
-    merged = query_tok.merge(corpus_tok, on="token", suffixes=("_q", "_c"))
-    if merged.empty:
-        return pd.Series(dtype=object)
-    counts = merged.groupby(["entity_id_q", "entity_id_c"]).size().reset_index(name="n")
-    counts = counts.sort_values("n", ascending=False)
-    top = counts.groupby("entity_id_q").head(k)
-    return top.groupby("entity_id_q")["entity_id_c"].apply(set)
+def top_k_matches(query_matrix, corpus_matrix, corpus_ids, k):
+    """query_matrix: sparse (n_query x vocab). corpus_matrix: sparse (n_corpus x vocab).
+    Returns list of sets of corpus_ids, one per query row, top-k by shared-token count."""
+    sim = query_matrix @ corpus_matrix.T  # sparse (n_query x n_corpus), values = shared token count
+    sim = sim.tocsr()
+    results = []
+    for i in range(sim.shape[0]):
+        row = sim.getrow(i)
+        if row.nnz == 0:
+            results.append(set())
+            continue
+        if row.nnz > k:
+            top_idx_local = np.argpartition(-row.data, k)[:k]
+        else:
+            top_idx_local = np.arange(row.nnz)
+        col_indices = row.indices[top_idx_local]
+        results.append({corpus_ids[j] for j in col_indices})
+    return results
 
 def already_written_ids(out_path):
     if not Path(out_path).exists():
@@ -68,7 +66,7 @@ def already_written_ids(out_path):
     return done
 
 def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path,
-                                 name_k=NAME_TOP_K, addr_k=ADDR_TOP_K, chunk_size=CHUNK_SIZE):
+                                 name_k=NAME_TOP_K, addr_k=ADDR_TOP_K, query_chunk=QUERY_CHUNK):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -94,47 +92,48 @@ def generate_candidates_to_file(s1_df, s2_df, s3_df, out_path,
                 print("  already done, skipping", flush=True)
                 continue
 
-            print("  building corpus token tables...", flush=True)
-            name2_raw = token_table(s2_c["entity_id"].values, normalize_name_series(s2_c["business_name"]))
-            name3_raw = token_table(s3_c["entity_id"].values, normalize_name_series(s3_c["business_name"]))
-            addr2_raw = token_table(s2_c["entity_id"].values, normalize_address_series(s2_c["business_address"]))
-            addr3_raw = token_table(s3_c["entity_id"].values, normalize_address_series(s3_c["business_address"]))
+            print("  vectorizing corpus (name + address)...", flush=True)
+            name2_txt = normalize_name_series(s2_c["business_name"]).values
+            name3_txt = normalize_name_series(s3_c["business_name"]).values
+            addr2_txt = normalize_address_series(s2_c["business_address"]).values
+            addr3_txt = normalize_address_series(s3_c["business_address"]).values
 
-            name_banned = get_banned_tokens(name2_raw, len(s2_c)) | get_banned_tokens(name3_raw, len(s3_c))
-            addr_banned = get_banned_tokens(addr2_raw, len(s2_c)) | get_banned_tokens(addr3_raw, len(s3_c))
+            name2_vec, name2_mat = build_vectorizer(name2_txt)
+            name3_vec, name3_mat = build_vectorizer(name3_txt)
+            addr2_vec, addr2_mat = build_vectorizer(addr2_txt)
+            addr3_vec, addr3_mat = build_vectorizer(addr3_txt)
 
-            name2 = name2_raw[~name2_raw["token"].isin(name_banned)]
-            name3 = name3_raw[~name3_raw["token"].isin(name_banned)]
-            addr2 = addr2_raw[~addr2_raw["token"].isin(addr_banned)]
-            addr3 = addr3_raw[~addr3_raw["token"].isin(addr_banned)]
+            s2_ids = s2_c["entity_id"].values
+            s3_ids = s3_c["entity_id"].values
 
-            s1_name_series = normalize_name_series(s1_c["business_name"])
-            s1_addr_series = normalize_address_series(s1_c["business_address"])
+            s1_name_txt = normalize_name_series(s1_c["business_name"]).values
+            s1_addr_txt = normalize_address_series(s1_c["business_address"]).values
+            s1_ids = s1_c["entity_id"].values
             total = len(s1_c)
-            print(f"  {total} entities to process, in chunks of {chunk_size}", flush=True)
+            print(f"  {total} entities to process, in chunks of {query_chunk}", flush=True)
 
-            for start in range(0, total, chunk_size):
-                idx_slice = slice(start, start + chunk_size)
-                chunk_ids = s1_c["entity_id"].values[idx_slice]
-                chunk_name = s1_name_series.values[idx_slice]
-                chunk_addr = s1_addr_series.values[idx_slice]
+            for start in range(0, total, query_chunk):
+                end = min(start + query_chunk, total)
+                chunk_ids = s1_ids[start:end]
+                chunk_name = s1_name_txt[start:end]
+                chunk_addr = s1_addr_txt[start:end]
 
-                q_name = pd.DataFrame({"entity_id": chunk_ids, "token": chunk_name})
-                q_name = token_table(q_name["entity_id"].values, q_name["token"], banned=name_banned)
-                q_addr_df = pd.DataFrame({"entity_id": chunk_ids, "token": chunk_addr})
-                q_addr = token_table(q_addr_df["entity_id"].values, q_addr_df["token"], banned=addr_banned)
+                qn2 = name2_vec.transform(chunk_name)
+                qn3 = name3_vec.transform(chunk_name)
+                qa2 = addr2_vec.transform(chunk_addr)
+                qa3 = addr3_vec.transform(chunk_addr)
 
-                r1 = top_k_via_merge(q_name, name2, name_k)
-                r2 = top_k_via_merge(q_name, name3, name_k)
-                r3 = top_k_via_merge(q_addr, addr2, addr_k)
-                r4 = top_k_via_merge(q_addr, addr3, addr_k)
+                r1 = top_k_matches(qn2, name2_mat, s2_ids, name_k)
+                r2 = top_k_matches(qn3, name3_mat, s3_ids, name_k)
+                r3 = top_k_matches(qa2, addr2_mat, s2_ids, addr_k)
+                r4 = top_k_matches(qa3, addr3_mat, s3_ids, addr_k)
 
-                for eid in chunk_ids:
-                    cands = r1.get(eid, set()) | r2.get(eid, set()) | r3.get(eid, set()) | r4.get(eid, set())
+                for i, eid in enumerate(chunk_ids):
+                    cands = r1[i] | r2[i] | r3[i] | r4[i]
                     writer.writerow([eid, ",".join(sorted(cands))])
 
                 f.flush()
-                print(f"    {min(start+chunk_size, total)}/{total} processed", flush=True)
+                print(f"    {end}/{total} processed", flush=True)
 
     print(f"\ndone — output at {out_path}", flush=True)
 
