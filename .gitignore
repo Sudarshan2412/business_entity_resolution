@@ -7,3 +7,5 @@ output/*.tsv
 __pycache__/
 *.pyc
 .DS_Store
+output/*.parquet
+*.parquet
